@@ -1,5 +1,8 @@
+import os
+
 import numpy as np
 import tensorflow as tf
+from keras.src.saving import load_model
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense, Reshape, Flatten, LeakyReLU, BatchNormalization
 import matplotlib.pyplot as plt
@@ -11,7 +14,8 @@ from queue import PriorityQueue
 PUZZLE_SIZE = 3
 SEED_SIZE = 100
 EPOCHS = 1000
-BATCH_SIZE = 32
+BATCH_SIZE = 16
+MODEL_SAVE_PATH = "saved_models"
 def generate_puzzle_batch(batch_size):
     puzzles = []
     for _ in range(batch_size):
@@ -102,42 +106,48 @@ def a_star_search(start):
 # GAN Generator and Discriminator
 def build_generator(seed_size):
     model = Sequential()
-    model.add(Dense(128, input_dim=seed_size))
+    model.add(Dense(128, input_dim=seed_size, kernel_initializer='he_normal'))
     model.add(LeakyReLU(alpha=0.2))
     model.add(BatchNormalization(momentum=0.8))
-    model.add(Dense(256))
+    model.add(Dense(256, kernel_initializer='he_normal'))
     model.add(LeakyReLU(alpha=0.2))
     model.add(BatchNormalization(momentum=0.8))
-    model.add(Dense(PUZZLE_SIZE * PUZZLE_SIZE, activation='softmax'))
+    model.add(Dense(PUZZLE_SIZE * PUZZLE_SIZE, activation='softmax', kernel_initializer='he_normal'))
     model.add(Reshape((PUZZLE_SIZE, PUZZLE_SIZE)))
     return model
+
 
 def build_discriminator():
     model = Sequential()
     model.add(Flatten(input_shape=(PUZZLE_SIZE, PUZZLE_SIZE)))
     model.add(Dense(128))
     model.add(LeakyReLU(alpha=0.2))
+    model.add(tf.keras.layers.Dropout(0.3))
     model.add(Dense(64))
     model.add(LeakyReLU(alpha=0.2))
     model.add(Dense(1, activation='sigmoid'))
     return model
+# Convert the generator's softmax output to a valid permutation
+def post_process_generated_puzzle(generated_puzzle):
+    flat_puzzle = np.argsort(generated_puzzle.flatten())  # Convert probabilities to a ranking
+    valid_puzzle = flat_puzzle.reshape((PUZZLE_SIZE, PUZZLE_SIZE))  # Reshape into the puzzle grid
+    return valid_puzzle
 
 # Training GAN
 def train_gan(generator, discriminator, dataset, epochs, batch_size, seed_size):
     cross_entropy = tf.keras.losses.BinaryCrossentropy()
-    generator_optimizer = tf.keras.optimizers.Adam(1.5e-4, 0.5)
-    discriminator_optimizer = tf.keras.optimizers.Adam(1.5e-4, 0.5)
+    generator_optimizer = tf.keras.optimizers.Adam(2e-4, 0.5, decay=1e-6)
+    discriminator_optimizer = tf.keras.optimizers.Adam(1e-5, 0.5, decay=1e-6)
+    valid_puzzle_found = False
 
     @tf.function
-    def train_step(puzzles):
-        noise = tf.random.normal([batch_size, seed_size])
-
+    def train_step(puzzles, noise, invalid_penalty):
         with tf.GradientTape() as gen_tape, tf.GradientTape() as disc_tape:
             generated_puzzles = generator(noise, training=True)
             real_output = discriminator(puzzles, training=True)
             fake_output = discriminator(generated_puzzles, training=True)
 
-            gen_loss = cross_entropy(tf.ones_like(fake_output), fake_output)
+            gen_loss = cross_entropy(tf.ones_like(fake_output), fake_output) + invalid_penalty * 3
             disc_loss = cross_entropy(tf.ones_like(real_output), real_output) + \
                         cross_entropy(tf.zeros_like(fake_output), fake_output)
 
@@ -151,7 +161,59 @@ def train_gan(generator, discriminator, dataset, epochs, batch_size, seed_size):
 
     for epoch in range(epochs):
         for puzzle_batch in dataset:
-            train_step(puzzle_batch)
+            noise = tf.random.normal([batch_size, seed_size]) + tf.random.normal([batch_size, seed_size], mean=0, stddev=0.1)
+            generated_puzzles = generator(noise, training=False).numpy()
+
+            # Check for invalid puzzles
+            invalid_penalty = 0.0
+            for puzzle in generated_puzzles:
+                flat_puzzle = puzzle.flatten()
+
+                # Check for decimals
+                if not np.allclose(flat_puzzle, flat_puzzle.astype(int)):
+                    invalid_penalty += 1.0  # Penalize for decimals
+
+                # Check for duplicates or missing numbers
+                unique_numbers = np.unique(flat_puzzle.astype(int))
+                if len(unique_numbers) != PUZZLE_SIZE * PUZZLE_SIZE or not np.all(np.isin(range(PUZZLE_SIZE * PUZZLE_SIZE), unique_numbers)):
+                    invalid_penalty += 1.0  # Penalize for duplicates or missing numbers
+
+                # Check for solvability
+                if len(unique_numbers) == PUZZLE_SIZE * PUZZLE_SIZE and np.all(np.isin(range(PUZZLE_SIZE * PUZZLE_SIZE), unique_numbers)):
+                    if not is_solvable(puzzle.astype(int)):
+                        invalid_penalty += 1.0  # Penalize for unsolvability
+
+            invalid_penalty /= batch_size  # Average the penalty across the batch
+
+            gen_loss, disc_loss = train_step(puzzle_batch, noise, invalid_penalty)
+
+        print(f"Epoch {epoch+1}/{epochs} | Gen Loss: {gen_loss.numpy():.4f} | "
+              f"Disc Loss: {disc_loss.numpy():.4f} | Invalid Penalty: {invalid_penalty:.4f}")
+
+        # Test generator output periodically
+        # Test generator output periodically
+        test_noise = tf.random.normal([1, seed_size])
+        test_puzzle = generator(test_noise, training=False).numpy()
+        test_puzzle = post_process_generated_puzzle(test_puzzle)
+
+        # Save models if a valid puzzle is generated
+        flat_test_puzzle = test_puzzle.flatten().astype(int)
+        if (np.allclose(flat_test_puzzle, flat_test_puzzle.astype(int)) and
+            len(np.unique(flat_test_puzzle)) == PUZZLE_SIZE * PUZZLE_SIZE and
+            np.all(np.isin(range(PUZZLE_SIZE * PUZZLE_SIZE), flat_test_puzzle)) and
+            is_solvable(test_puzzle.astype(int))):
+            valid_puzzle_found = True
+            print(f"Valid solvable puzzle generated at epoch {epoch+1}:")
+            print(test_puzzle.astype(int))
+            generator.save("generator_model.keras")
+            discriminator.save("discriminator_model.keras")
+            print("Models saved successfully!")
+            return flat_test_puzzle
+    if not valid_puzzle_found:
+        print("No valid solvable puzzle generated during training. Consider increasing epochs.")
+
+
+
 
 # Display Puzzle in Pygame
 def render_puzzle(fig, puzzle):
@@ -172,7 +234,7 @@ def render_puzzle(fig, puzzle):
     ax.set_yticklabels([])
     ax.set_aspect('equal')
 
-def pygame_interface(initial_path):
+def pygame_interface(generator):
     pygame.init()
     screen = pygame.display.set_mode((600, 600))
     pygame.display.set_caption("Puzzle Solver")
@@ -181,14 +243,31 @@ def pygame_interface(initial_path):
     fig = plt.figure(figsize=(6, 6))
     canvas = FigureCanvas(fig)
 
-    solution_path = initial_path  # Start with the initial path
-    step_index = 0
+
 
     def generate_new_puzzle():
         """Generate a new solvable puzzle and solve it."""
-        new_puzzle = generate_solvable_puzzle()
-        new_path, _ = a_star_search(new_puzzle)
+        noise = tf.random.normal([1, SEED_SIZE])
+        generated_puzzle = generator(noise, training=False).numpy().reshape((PUZZLE_SIZE, PUZZLE_SIZE))
+
+        # Convert softmax output to a valid permutation
+        generated_puzzle = np.argsort(generated_puzzle.flatten())  # Ensure valid permutation
+        generated_puzzle = generated_puzzle.reshape((PUZZLE_SIZE, PUZZLE_SIZE))
+
+        # Ensure the puzzle is solvable
+        if not is_solvable(generated_puzzle):
+            print("Generated puzzle was not solvable, regenerating...")
+            return generate_new_puzzle()
+
+        print("New solvable puzzle generated:")
+        print(generated_puzzle)
+
+        # Solve the puzzle
+        new_path, _ = a_star_search(generated_puzzle)
         return new_path
+
+    solution_path = generate_new_puzzle()  # Start with the initial path
+    step_index = 0
 
     running = True
     while running:
@@ -239,21 +318,13 @@ def pygame_interface(initial_path):
 # Main Execution
 puzzle_data = generate_puzzle_batch(1000)
 dataset = tf.data.Dataset.from_tensor_slices(puzzle_data).batch(BATCH_SIZE)
+if os.path.exists("generator_model.keras"):
+    print("Loading saved models...")
+    generator = load_model("generator_model.keras")
+    discriminator = load_model("discriminator_model.keras")
+else:
+    generator = build_generator(SEED_SIZE)
+    discriminator = build_discriminator()
+    train_gan(generator, discriminator, dataset, EPOCHS, BATCH_SIZE, SEED_SIZE)
 
-generator = build_generator(SEED_SIZE)
-discriminator = build_discriminator()
-
-train_gan(generator, discriminator, dataset, EPOCHS, BATCH_SIZE, SEED_SIZE)
-
-noise = tf.random.normal([1, SEED_SIZE])
-generated_puzzle = generator(noise, training=False).numpy().reshape((PUZZLE_SIZE, PUZZLE_SIZE))
-
-# Convert the softmax output to a valid permutation
-generated_puzzle = np.argsort(generated_puzzle.flatten())  # Ensure valid permutation
-generated_puzzle = generated_puzzle.reshape((PUZZLE_SIZE, PUZZLE_SIZE))
-if not is_solvable(generated_puzzle):
-    generated_puzzle = generate_solvable_puzzle()
-
-solution_path, _ = a_star_search(generated_puzzle)
-
-pygame_interface(solution_path)
+pygame_interface(generator)
